@@ -3,9 +3,12 @@ package radix
 import (
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 // dedupe is used to deduplicate a function invocation, so if multiple
@@ -72,6 +75,10 @@ type Cluster struct {
 	// nothing is reading the channel the errors will be dropped. The channel
 	// will be closed when the Close is called.
 	ErrCh chan error
+
+	// ao
+	log                 *zap.SugaredLogger
+	initialClusterAddrs []string // can store DNS entries
 }
 
 // NewCluster initializes and returns a Cluster instance. It will try every
@@ -83,12 +90,14 @@ type Cluster struct {
 //
 //	ClusterPoolFunc(DefaultClientFunc)
 //
-func NewCluster(clusterAddrs []string, opts ...ClusterOpt) (*Cluster, error) {
+func NewCluster(log *zap.SugaredLogger, clusterAddrs []string, opts ...ClusterOpt) (*Cluster, error) {
 	c := &Cluster{
-		syncDedupe: newDedupe(),
-		pools:      map[string]Client{},
-		closeCh:    make(chan struct{}),
-		ErrCh:      make(chan error, 1),
+		syncDedupe:          newDedupe(),
+		pools:               map[string]Client{},
+		closeCh:             make(chan struct{}),
+		ErrCh:               make(chan error, 1),
+		initialClusterAddrs: clusterAddrs,
+		log:                 log,
 	}
 
 	defaultClusterOpts := []ClusterOpt{
@@ -105,14 +114,17 @@ func NewCluster(clusterAddrs []string, opts ...ClusterOpt) (*Cluster, error) {
 	}
 
 	// make a pool to base the cluster on
-	for _, addr := range clusterAddrs {
-		p, err := c.co.pf("tcp", addr)
-		if err != nil {
-			continue
-		}
-		c.pools[addr] = p
-		break
-	}
+	//for _, addr := range clusterAddrs {
+	//	p, err := c.co.pf("tcp", addr)
+	//	if err != nil {
+	//		continue
+	//	}
+	//	c.pools[addr] = p
+	//	break
+	//}
+
+	// replace creation of pools with the clever one that goes through DNS reading
+	c.updatePoolsFromDNS()
 
 	if err := c.Sync(); err != nil {
 		for _, p := range c.pools {
@@ -122,6 +134,9 @@ func NewCluster(clusterAddrs []string, opts ...ClusterOpt) (*Cluster, error) {
 	}
 
 	c.syncEvery(30 * time.Second)
+
+	// ao
+	c.updateClusterPoolFromDNSEvery(10 * time.Second)
 
 	return c, nil
 }
@@ -281,7 +296,8 @@ func (c *Cluster) syncEvery(d time.Duration) {
 	}()
 }
 
-func (c *Cluster) addrForKey(key string) string {
+// ao note : made public
+func (c *Cluster) AddrForKey(key string) string {
 	s := ClusterSlot([]byte(key))
 	c.l.RLock()
 	defer c.l.RUnlock()
@@ -311,7 +327,7 @@ func (c *Cluster) Do(a Action) error {
 		return err
 	} else {
 		key = keys[0]
-		addr = c.addrForKey(key)
+		addr = c.AddrForKey(key)
 	}
 
 	return c.doInner(a, addr, key, false, doAttempts)
@@ -421,4 +437,146 @@ func (c *Cluster) Close() error {
 		closeErr = pErr
 	})
 	return closeErr
+}
+
+// ao : DNS handling
+// -------------------------------------------
+
+func (c *Cluster) resolveClusterHostPorts() []string {
+	smap := make(map[string]struct{})
+	for _, addr := range c.initialClusterAddrs {
+
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			c.log.Infof("Bad host:port %s", addr)
+			continue
+		}
+
+		ips, err := net.LookupIP(host)
+		if err != nil {
+			c.log.Infof("Error while resolving %s : %s", addr, err)
+			continue
+		}
+		ipl := ""
+		for _, ip := range ips {
+			ipport := ip.String() + ":" + port
+			smap[ipport] = struct{}{}
+			ipl = ipl + ipport + ", "
+		}
+		c.log.Debugf("Resolved %s : %s", addr, ipl)
+	}
+	out := []string{}
+	for k := range smap {
+		out = append(out, k)
+	}
+	c.log.Debugf("deduped Resolved ips:ports : %s", out)
+	return out
+}
+
+// this will attempt a connection to an IP and add it to the cluster pool if
+// connection is successful
+// this is threadsafe
+func (c *Cluster) safeCreatePoolForAddr(addr string) error {
+	// check if there is already a connection in the pool before creating new one
+	c.l.Lock()
+	_, ok := c.pools[addr]
+	c.l.Unlock()
+	if ok {
+		return nil
+	}
+
+	// it's important that the cluster pool set isn't locked while this is
+	// happening, because this could block for a while
+	p, err := c.co.pf("tcp", addr)
+	if err != nil {
+		return err
+	}
+
+	// we've made a new pool, but we need to double-check someone else didn't
+	// make one at the same time and add it in first. If they did, close this
+	// one and return that one
+	c.l.Lock()
+	if _, ok := c.pools[addr]; ok {
+		c.l.Unlock()
+		p.Close()
+		return nil
+	}
+	c.pools[addr] = p
+	c.l.Unlock()
+	return nil
+}
+
+func (c *Cluster) debugPoolHosts() {
+	c.l.RLock()
+	addrs := make([]string, 0, len(c.pools))
+	for addr := range c.pools {
+		addrs = append(addrs, addr)
+	}
+	c.l.RUnlock()
+	c.log.Debugf("pool hosts : %s", addrs)
+}
+
+func (c *Cluster) updatePoolsFromDNS() error {
+
+	ips := c.resolveClusterHostPorts()
+
+	c.debugPoolHosts()
+
+	// retrieve the pools
+	c.l.RLock()
+	addrs := make([]string, 0, len(c.pools))
+	for addr := range c.pools {
+		addrs = append(addrs, addr)
+	}
+	c.l.RUnlock()
+
+	// decide if pools needs to be created.
+	// the DNS returns masters and slaves, but the pool only contain masters
+
+	// note : this is designed to work with openshift headless service where the DNS
+	// returns all possible IPs of the pods.
+	// for the moment, only apply if the cluster has no adresses at all
+
+	//poolHasIp := false
+
+	// make a pool to base the cluster on
+	//for _, addr := range ips {
+	//	if contains(addrs, addr) {
+	//		poolHasIp = true
+	//	}
+	//}
+
+	poolHasIp := len(addrs) > 0
+
+	if !poolHasIp {
+		c.log.Infof("pool missing IPs from DNS. creating pools")
+		for _, addr := range ips {
+			// todo : parallelize running in goroutine
+			c.safeCreatePoolForAddr(addr)
+		}
+	} else {
+		c.log.Debugf("pool has at least one IPs from DNS. nothing to do")
+	}
+
+	return nil
+}
+
+func (c *Cluster) updateClusterPoolFromDNSEvery(d time.Duration) {
+	c.closeWG.Add(1)
+	go func() {
+		defer c.closeWG.Done()
+		t := time.NewTicker(d)
+		defer t.Stop()
+
+		for {
+			select {
+			case <-t.C:
+				if err := c.updatePoolsFromDNS(); err != nil {
+					c.err(err)
+				}
+			case <-c.closeCh:
+				return
+			}
+		}
+	}()
 }

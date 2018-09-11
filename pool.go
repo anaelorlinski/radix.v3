@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mediocregopher/radix.v3/resp"
+	"go.uber.org/zap"
 )
 
 // ErrPoolEmpty is used by Pools created using the PoolOnEmptyErrAfter option
@@ -50,6 +51,9 @@ func (spc *staticPoolConn) Do(a Action) error {
 
 func (spc *staticPoolConn) Close() error {
 	spc.lastIOErr = io.EOF
+	if spc.sp.log != nil {
+		spc.sp.log.Infof("SPC %s close", spc.NetConn().RemoteAddr().String())
+	}
 	return spc.Conn.Close()
 }
 
@@ -188,6 +192,8 @@ type Pool struct {
 	wg       sync.WaitGroup
 	closeCh  chan bool
 	initDone chan struct{} // used for tests
+
+	log *zap.SugaredLogger
 }
 
 // NewPool creates a *Pool which will hold up to the given number of connections
@@ -202,13 +208,14 @@ type Pool struct {
 //	PoolOnFullClose()
 //	PoolPingInterval(10 * time.Second / size)
 //
-func NewPool(network, addr string, size int, opts ...PoolOpt) (*Pool, error) {
+func NewPool(log *zap.SugaredLogger, network, addr string, size int, opts ...PoolOpt) (*Pool, error) {
 	sp := &Pool{
 		network:  network,
 		addr:     addr,
 		size:     size,
 		closeCh:  make(chan bool),
 		initDone: make(chan struct{}),
+		log:      log,
 	}
 
 	defaultPoolOpts := []PoolOpt{
@@ -293,6 +300,9 @@ func (sp *Pool) newConn(errIfFull bool) (*staticPoolConn, error) {
 	}
 	sp.totalConns++
 
+	if spc.sp.log != nil {
+		spc.sp.log.Infof("SPC %s new", spc.NetConn().RemoteAddr().String())
+	}
 	return spc, nil
 }
 
